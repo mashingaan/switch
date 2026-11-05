@@ -15,6 +15,13 @@ const probe: AcpProviderHooks = {
     approvals: false,
     userInput: false,
   },
+  mcpServerOf: (call) => {
+    if (call._meta?.is_mcp_tool_call !== true || !call.title) return undefined
+    const separator = call.title.indexOf('/')
+    return separator > 0 && separator < call.title.length - 1
+      ? call.title.slice(0, separator)
+      : undefined
+  },
   permission: (_context, request) => {
     const call = request.toolCall
     const input = call.rawInput ?? {}
