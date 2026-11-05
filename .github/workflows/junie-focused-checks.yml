@@ -1,0 +1,90 @@
+name: Junie focused source checks
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  console:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.source_ref }}
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 10.28.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: console/.nvmrc
+          cache: pnpm
+          cache-dependency-path: console/pnpm-lock.yaml
+      - run: df -h .
+      - name: Install focused dependencies
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+        run: pnpm install --frozen-lockfile --ignore-scripts --filter @switch-console/agent-providers... --filter @switch-console/plugins...
+      - name: Build package exports
+        run: pnpm -r --filter @switch-console/agent-providers... --filter @switch-console/plugins... run build
+      - name: Adapter regression tests
+        if: ${{ !cancelled() }}
+        working-directory: console/packages/agent-providers
+        run: pnpm exec vitest run src/junie/junie-acp.test.ts src/acp/acp-adapter.test.ts src/host/agent-env.test.ts --maxWorkers=1
+      - name: Plugin registry tests
+        if: ${{ !cancelled() }}
+        working-directory: console/packages/plugins
+        run: pnpm exec vitest run src/agents/impl/index.test.ts src/agents/session-launch.test.ts --maxWorkers=1
+      - name: Typecheck providers
+        if: ${{ !cancelled() }}
+        run: pnpm --filter @switch-console/agent-providers run typecheck
+      - name: Typecheck plugins
+        if: ${{ !cancelled() }}
+        run: pnpm --filter @switch-console/plugins run typecheck
+      - name: Format contributed TypeScript on hosted runner
+        if: ${{ !cancelled() }}
+        shell: python
+        run: |
+          import pathlib, subprocess, shutil
+          root = pathlib.Path.cwd().parent
+          paths = subprocess.check_output(['git', 'diff', '--name-only', 'e929824c74f6b57912fef7e0fd2e5968752747a0', 'HEAD', '--', '*.ts'], cwd=root, text=True).splitlines()
+          subprocess.run(['pnpm', 'exec', 'oxfmt', '--write', *[str(root / path) for path in paths]], cwd=root / 'console/packages/plugins', check=True)
+          for path in paths:
+              target = root / 'formatted-source' / path
+              target.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(root / path, target)
+      - name: Return formatted source for review
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: junie-formatted-source
+          path: formatted-source/
+          retention-days: 3
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.source_ref }}
+      - run: df -h .
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv sync --project core
+      - name: Core provider registry tests
+        run: uv run --project core pytest -c core/pyproject.toml core/tests/switch_core/providers/test_provider_registry.py -q
+      - name: Core lint
+        if: ${{ !cancelled() }}
+        run: uv run --project core ruff check core/switch_core/providers/registry.py core/tests/switch_core/providers/test_provider_registry.py
+      - name: Core format
+        if: ${{ !cancelled() }}
+        run: uv run --project core ruff format --check core/switch_core/providers/registry.py core/tests/switch_core/providers/test_provider_registry.py
