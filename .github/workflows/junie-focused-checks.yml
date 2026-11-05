@@ -56,6 +56,7 @@ jobs:
           xvfb-run -a -s '-screen 0 1440x1000x24' dbus-run-session -- bash -euo pipefail <<'SESSION'
           printf '%s' 'temporary-keyring-preflight' | gnome-keyring-daemon --login
           eval "$(gnome-keyring-daemon --start --components=secrets)"
+          export XDG_CURRENT_DESKTOP=GNOME
           printf '%s' 'temporary-keyring-preflight' | secret-tool store --label='Switch safe storage preflight' service switch-console account runner
           test "$(secret-tool lookup service switch-console account runner)" = 'temporary-keyring-preflight'
           printf '%s\n' 'PASS: libsecret stored and retrieved a temporary value'
@@ -64,7 +65,9 @@ jobs:
           cat > "$RUNNER_TEMP/safe-storage-preflight/main.cjs" <<'PREFLIGHT'
           const { app, safeStorage } = require('electron')
           app.whenReady().then(() => {
-            if (!safeStorage.isEncryptionAvailable()) {
+            const backend = safeStorage.getSelectedStorageBackend()
+            console.log('SAFE_STORAGE_BACKEND=' + backend)
+            if (backend !== 'gnome_libsecret' || !safeStorage.isEncryptionAvailable()) {
               console.error('SAFE_STORAGE_PRECHECK=unavailable')
               app.exit(1)
               return
@@ -86,7 +89,7 @@ jobs:
           sudo chown root:root "$SANDBOX_HELPER"
           sudo chmod 4755 "$SANDBOX_HELPER"
           test "$(stat -c '%U:%a' "$SANDBOX_HELPER")" = 'root:4755'
-          "$ELECTRON_BIN" "$RUNNER_TEMP/safe-storage-preflight"
+          "$ELECTRON_BIN" --password-store=gnome-libsecret "$RUNNER_TEMP/safe-storage-preflight"
           cat > "$RUNNER_TEMP/prepare-junie.py" <<'PY'
           import json
           import os
@@ -170,7 +173,7 @@ jobs:
           const home = path.join(process.env.RUNNER_TEMP, 'console-demo-home')
           await mkdir(evidence, { recursive: true })
           await mkdir(home, { recursive: true })
-          const env = Object.fromEntries(['PATH', 'DISPLAY', 'XAUTHORITY', 'LANG', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'JUNIE_OPENROUTER_API_KEY', 'JUNIE_HOME', 'JUNIE_MODEL'].filter(key => process.env[key]).map(key => [key, process.env[key]]))
+          const env = Object.fromEntries(['PATH', 'DISPLAY', 'XAUTHORITY', 'LANG', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_CURRENT_DESKTOP', 'JUNIE_OPENROUTER_API_KEY', 'JUNIE_HOME', 'JUNIE_MODEL'].filter(key => process.env[key]).map(key => [key, process.env[key]]))
           Object.assign(env, { HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), CI: '1', SWITCH_CONSOLE_SERVER_VERSION: 'checkout' })
           let app
           let page
@@ -191,7 +194,7 @@ jobs:
           try {
             recording = spawn('ffmpeg', ['-y', '-loglevel', 'error', '-f', 'x11grab', '-video_size', '1440x1000', '-framerate', '8', '-i', process.env.DISPLAY, '-t', '180', '-an', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '30', path.join(evidence, 'console-session.mp4')], { stdio: 'ignore' })
             recordingClosed = new Promise(resolve => recording.once('close', resolve))
-            app = await _electron.launch({ executablePath: require('electron'), args: [desktop], cwd: desktop, env, timeout: 60000 })
+            app = await _electron.launch({ executablePath: require('electron'), args: ['--password-store=gnome-libsecret', desktop], cwd: desktop, env, timeout: 60000 })
             page = await app.firstWindow({ timeout: 45000 })
             await page.waitForLoadState('domcontentloaded')
             await page.locator('body').waitFor({ state: 'visible' })
