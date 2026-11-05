@@ -1,5 +1,8 @@
 name: Junie Console feasibility
 on:
+  push:
+    branches:
+      - junie-ci
   workflow_dispatch:
     inputs:
       source_ref:
@@ -17,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ inputs.source_ref || '89d832481e379618a4c5ebec26fbc014f5885f01' }}
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
           version: 10.28.2
