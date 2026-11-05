@@ -48,7 +48,7 @@ jobs:
       - name: Typecheck plugins
         if: ${{ !cancelled() }}
         run: pnpm --filter @switch-console/plugins run typecheck
-      - name: Format contributed TypeScript on hosted runner
+      - name: Check contributed TypeScript formatting and lint
         if: ${{ !cancelled() }}
         shell: python
         run: |
@@ -63,7 +63,8 @@ jobs:
               'console/packages/plugins/src/agents/impl/junie/icon.ts',
               'console/packages/plugins/src/agents/plugin-registry.ts',
           ]
-          subprocess.run(['pnpm', 'exec', 'oxfmt', '--write', *[str(root / path) for path in paths]], cwd=root / 'console/packages/plugins', check=True)
+          subprocess.run(['pnpm', 'exec', 'oxfmt', '--check', *[str(root / path) for path in paths]], cwd=root / 'console/packages/plugins', check=True)
+          subprocess.run(['pnpm', 'exec', 'oxlint', '--config', str(root / 'console/apps/switch-console-desktop/.oxlintrc.json'), *[str(root / path) for path in paths]], cwd=root / 'console/packages/plugins', check=True)
           for path in paths:
               target = root / 'formatted-source' / path
               target.parent.mkdir(parents=True, exist_ok=True)
