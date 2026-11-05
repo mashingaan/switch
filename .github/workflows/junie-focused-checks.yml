@@ -63,9 +63,22 @@ jobs:
           const env = Object.fromEntries(['PATH', 'DISPLAY', 'XAUTHORITY', 'LANG', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'].filter(key => process.env[key]).map(key => [key, process.env[key]]))
           Object.assign(env, { HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), CI: '1', SWITCH_CONSOLE_SERVER_VERSION: 'checkout' })
           let app
+          let page
+          let stage = 'launch'
+          const redact = text => text.replace(/(postgres(?:ql)?:\/\/)[^@\s]+@/g, '$1[REDACTED]@').replace(/((?:password|token|secret|api.key)\s*[:=]\s*)\S+/gi, '$1[REDACTED]')
+          async function capture(label) {
+            if (!page || page.isClosed()) return
+            const controls = []
+            for (const button of await page.getByRole('button').all()) {
+              if (await button.isVisible()) controls.push({ text: await button.innerText(), accessible: await button.ariaSnapshot(), disabled: await button.isDisabled() })
+            }
+            const state = { stage, url: page.url(), headings: await page.getByRole('heading').allTextContents(), controls, text: await page.locator('body').innerText() }
+            await writeFile(path.join(evidence, label + '.json'), redact(JSON.stringify(state, null, 2)))
+            await page.screenshot({ path: path.join(evidence, label + '.png'), mask: [page.locator('input, textarea, pre, [role="log"]')] })
+          }
           try {
             app = await _electron.launch({ executablePath: require('electron'), args: ['--no-sandbox', desktop], cwd: desktop, env, timeout: 60000 })
-            const page = await app.firstWindow({ timeout: 45000 })
+            page = await app.firstWindow({ timeout: 45000 })
             await page.waitForLoadState('domcontentloaded')
             await page.locator('body').waitFor({ state: 'visible' })
             await page.screenshot({ path: path.join(evidence, 'console-launch.png') })
@@ -75,25 +88,37 @@ jobs:
             const skip = page.getByRole('button', { name: 'Skip', exact: true })
             if (await skip.isVisible()) await skip.click()
             await page.getByRole('button', { name: 'Get started', exact: true }).click({ timeout: 30000 })
+            stage = 'how-to-run'
+            await page.getByRole('heading', { name: 'How do you want to run Switch?', exact: true }).waitFor()
             await page.getByRole('radio', { name: /On this computer/ }).click()
+            await capture('before-continue')
             await page.getByRole('button', { name: 'Continue', exact: true }).click()
-            await page.getByRole('button', { name: 'Start', exact: true }).click({ timeout: 30000 })
+            stage = 'local-setup'
+            await page.getByRole('heading', { name: 'Set up a server on this computer', exact: true }).waitFor({ timeout: 30000 })
+            await capture('after-continue')
             const ready = page.getByText('Local server is running', { exact: true })
+            // ConfirmButton adds a shortcut image's aria-label to its name.
+            // Inspect the real screen before acting and keep its semantic prefix.
+            if (!(await ready.isVisible())) {
+              if (await page.getByRole('button', { name: /^Retry\b/ }).isVisible()) throw new Error('Local setup already reports an error, no automatic retry')
+              await page.getByRole('button', { name: /^Start\b/ }).click({ timeout: 30000 })
+            }
+            stage = 'native-server-start'
             const deadline = Date.now() + 240000
             let started = false
             while (Date.now() < deadline) {
               if (await ready.isVisible()) { started = true
                 break }
-              if (await page.getByRole('button', { name: 'Retry', exact: true }).isVisible()) break
+              if (await page.getByRole('button', { name: /^Retry\b/ }).isVisible()) break
               await new Promise(resolve => setTimeout(resolve, 2000))
             }
-            const redact = text => text.replace(/(postgres(?:ql)?:\/\/)[^@\s]+@/g, '$1[REDACTED]@').replace(/((?:password|token|secret|api.key)\s*[:=]\s*)\S+/gi, '$1[REDACTED]')
             const result = { nativeServerReady: started, alerts: (await page.getByRole('alert').allTextContents()).map(redact), buttons: await page.getByRole('button').allTextContents() }
             await writeFile(path.join(evidence, 'native-server-result.json'), JSON.stringify(result, null, 2))
             console.log(JSON.stringify(result))
             if (!started) throw new Error('Real native-server setup did not complete within the bounded feasibility attempt. See sanitized native-server-result.json.')
           } catch (error) {
-            await writeFile(path.join(evidence, 'launch-error.txt'), String(error))
+            await capture('error-state').catch(captureError => console.log('Unable to capture error state:', String(captureError)))
+            await writeFile(path.join(evidence, 'launch-error.txt'), redact(String(error)))
             throw error
           } finally {
             if (app) await app.close()
