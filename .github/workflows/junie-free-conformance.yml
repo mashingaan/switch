@@ -7,6 +7,16 @@ on:
         required: true
         default: '.'
         type: string
+      source_ref:
+        description: 'Exact source commit or branch to check out'
+        required: true
+        default: main
+        type: string
+      test_path:
+        description: 'Integration test file relative to agent-providers'
+        required: true
+        default: src/junie/junie-probe.integration.test.ts
+        type: string
 permissions:
   contents: read
 jobs:
@@ -15,6 +25,8 @@ jobs:
     timeout-minutes: 18
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.source_ref }}
       - name: Guarded free-only Junie setup
         env:
           JUNIE_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -91,6 +103,8 @@ jobs:
           with open(os.environ['GITHUB_ENV'], 'a') as f:
               f.write('JUNIE_BINARY=' + str(binary) + '\n')
               f.write('JUNIE_HOME=' + str(root / 'state') + '\n')
+              f.write('JUNIE_MODEL=custom:openrouter-free\n')
+              f.write('MAX_STEPS=8\n')
               f.write('OPENROUTER_USAGE_BEFORE=' + str(data.get('usage')) + '\n')
       - name: Set up pnpm
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
@@ -117,15 +131,16 @@ jobs:
         working-directory: console/packages/agent-providers
         env:
           TEST_PATTERN: ${{ inputs.scenarios }}
+          TEST_PATH: ${{ inputs.test_path }}
           JUNIE_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: pnpm exec vitest run src/junie/junie-probe.integration.test.ts --maxWorkers=1 --bail=1 --testNamePattern "$TEST_PATTERN" --reporter=default --reporter=json --outputFile=junie-conformance.json
+        run: pnpm exec vitest run "$TEST_PATH" --maxWorkers=1 --bail=1 --testNamePattern "$TEST_PATTERN" --reporter=default --reporter=json --outputFile=junie-conformance.json
       - name: Record outcome and key usage
         if: ${{ always() }}
         env:
           JUNIE_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         shell: python
         run: |
-          import os, json, pathlib, urllib.request
+          import os, json, pathlib, urllib.request, subprocess
           report = pathlib.Path('console/packages/agent-providers/junie-conformance.json')
           if report.exists():
               results = json.loads(report.read_text())
@@ -138,6 +153,7 @@ jobs:
               usage = json.load(r)['data'].get('usage')
           print('Key usage before:', os.environ.get('OPENROUTER_USAGE_BEFORE'), 'after:', usage)
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
-              f.write('Exact head: ' + os.environ['GITHUB_SHA'] + '\n')
+              source_head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+              f.write('Exact source head: ' + source_head + '\n')
               f.write('Custom OpenRouter model for both roles: cohere/north-mini-code:free\n')
               f.write('Key usage before: ' + os.environ.get('OPENROUTER_USAGE_BEFORE', 'unknown') + ', after: ' + str(usage) + '\n')
