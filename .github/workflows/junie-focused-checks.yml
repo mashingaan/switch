@@ -30,7 +30,7 @@ jobs:
         run: |
           df -h .
           sudo apt-get update -qq
-          sudo apt-get install -y xvfb ffmpeg libgtk-3-0 libnss3 libgbm1 libasound2t64
+          sudo apt-get install -y xvfb ffmpeg dbus-x11 gnome-keyring libsecret-tools libgtk-3-0 libnss3 libgbm1 libasound2t64
       - name: Install actual Console dependencies
         working-directory: console
         run: pnpm install --frozen-lockfile
@@ -48,6 +48,33 @@ jobs:
       - name: Launch real Console on Xvfb without credentials
         working-directory: console
         run: |
+          dbus-run-session -- bash -euo pipefail <<'SESSION'
+          eval "$(gnome-keyring-daemon --start --components=secrets)"
+          printf '%s' 'temporary-keyring-preflight' | secret-tool store --label='Switch safe storage preflight' service switch-console account runner
+          test "$(secret-tool lookup service switch-console account runner)" = 'temporary-keyring-preflight'
+          mkdir -p "$RUNNER_TEMP/safe-storage-preflight"
+          printf '%s\n' '{"main":"main.cjs"}' > "$RUNNER_TEMP/safe-storage-preflight/package.json"
+          cat > "$RUNNER_TEMP/safe-storage-preflight/main.cjs" <<'PREFLIGHT'
+          const { app, safeStorage } = require('electron')
+          app.whenReady().then(() => {
+            if (!safeStorage.isEncryptionAvailable()) {
+              console.error('SAFE_STORAGE_PRECHECK=unavailable')
+              app.exit(1)
+              return
+            }
+            const encrypted = safeStorage.encryptString('temporary-keyring-preflight')
+            const restored = safeStorage.decryptString(encrypted)
+            if (restored !== 'temporary-keyring-preflight') {
+              console.error('SAFE_STORAGE_PRECHECK=roundtrip-failed')
+              app.exit(1)
+              return
+            }
+            console.log('SAFE_STORAGE_PRECHECK=passed')
+            app.exit(0)
+          })
+          PREFLIGHT
+          ELECTRON_BIN="$(node -e "const { createRequire } = require('node:module'); const path = require('node:path'); console.log(createRequire(path.join(process.cwd(), 'apps/switch-console-desktop/package.json'))('electron'))")"
+          xvfb-run -a "$ELECTRON_BIN" --no-sandbox "$RUNNER_TEMP/safe-storage-preflight"
           cat > tooling-e2e/console-feasibility.mjs <<'JS'
           import { _electron } from 'playwright'
           import { createRequire } from 'node:module'
@@ -125,6 +152,7 @@ jobs:
           }
           JS
           xvfb-run -a -s '-screen 0 1440x1000x24' node tooling-e2e/console-feasibility.mjs
+          SESSION
       - name: Preserve launch evidence only
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
