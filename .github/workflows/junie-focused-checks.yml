@@ -48,10 +48,13 @@ jobs:
         run: |
           pnpm --filter @switch-console/desktop exec electron-vite build
           pnpm --filter @switch-console/desktop run build:sidecar
-      - name: Launch real Console on Xvfb without credentials
+      - name: Launch Console with free-only Junie profile and record a bounded video
         working-directory: console
+        env:
+          JUNIE_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
-          dbus-run-session -- bash -euo pipefail <<'SESSION'
+          xvfb-run -a -s '-screen 0 1440x1000x24' dbus-run-session -- bash -euo pipefail <<'SESSION'
+          printf '%s' 'temporary-keyring-preflight' | gnome-keyring-daemon --login
           eval "$(gnome-keyring-daemon --start --components=secrets)"
           printf '%s' 'temporary-keyring-preflight' | secret-tool store --label='Switch safe storage preflight' service switch-console account runner
           test "$(secret-tool lookup service switch-console account runner)" = 'temporary-keyring-preflight'
@@ -77,11 +80,79 @@ jobs:
           })
           PREFLIGHT
           ELECTRON_BIN="$(node -e "const { createRequire } = require('node:module'); const path = require('node:path'); console.log(createRequire(path.join(process.cwd(), 'apps/switch-console-desktop/package.json'))('electron'))")"
-          xvfb-run -a "$ELECTRON_BIN" --no-sandbox "$RUNNER_TEMP/safe-storage-preflight"
+          "$ELECTRON_BIN" "$RUNNER_TEMP/safe-storage-preflight"
+          cat > "$RUNNER_TEMP/prepare-junie.py" <<'PY'
+          import json
+          import os
+          import pathlib
+          import urllib.error
+          import urllib.request
+          import zipfile
+          key = os.environ.get('JUNIE_OPENROUTER_API_KEY', '')
+          def stop(reason):
+              print('STOP: ' + reason)
+              raise SystemExit(1)
+          if not key:
+              stop('OPENROUTER_API_KEY is missing')
+          def get(path):
+              request = urllib.request.Request('https://openrouter.ai/api/v1/' + path, headers={'Authorization': 'Bearer ' + key, 'User-Agent': 'switch-console-video'})
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return json.load(response)['data']
+              except urllib.error.HTTPError as error:
+                  stop('OpenRouter guardrail check returned HTTP ' + str(error.code))
+          key_state = get('key')
+          if key_state.get('limit') != 0:
+              stop('OpenRouter key is not capped at zero dollars. No model request sent.')
+          models = get('models/user')
+          def free_model(item):
+              pricing = item.get('pricing', {})
+              return item.get('id', '').endswith(':free') and 'prompt' in pricing and 'completion' in pricing and all(float(value) == 0 for value in pricing.values() if value is not None)
+          if not models or any(not free_model(item) for item in models):
+              stop('Key-scoped model catalog does not prove an exclusively free allowlist. No model request sent.')
+          model = 'cohere/north-mini-code:free'
+          allowed = [item for item in models if item.get('id') == model and 'tools' in item.get('supported_parameters', [])]
+          if not allowed:
+              stop('Pinned free tool-capable model is absent from the guarded catalog. No fallback.')
+          print('PASS: OpenRouter key has a zero-dollar limit and only explicitly free models are allowed')
+          root = pathlib.Path(os.environ['RUNNER_TEMP']).resolve()
+          archive = root / 'junie-release.zip'
+          url = 'https://github.com/JetBrains/junie-acp-release/releases/download/3959.5/junie-release-3959.5-linux-amd64.zip'
+          try:
+              with urllib.request.urlopen(url, timeout=90) as response:
+                  archive.write_bytes(response.read())
+              with zipfile.ZipFile(archive) as bundle:
+                  for member in bundle.infolist():
+                      destination = (root / member.filename).resolve()
+                      if not destination.is_relative_to(root):
+                          stop('Pinned Junie archive contains an unsafe path')
+                  bundle.extractall(root)
+                  for member in bundle.infolist():
+                      mode = member.external_attr >> 16
+                      if mode:
+                          (root / member.filename).chmod(mode)
+          except (urllib.error.URLError, zipfile.BadZipFile):
+              stop('Pinned Junie 3959.5 archive download or extraction failed')
+          binary = root / 'junie-app' / 'bin' / 'junie'
+          if not binary.is_file():
+              stop('Pinned Junie archive layout differs')
+          profile_home = root / 'junie-home'
+          profile_dir = profile_home / 'models'
+          profile_dir.mkdir(parents=True, exist_ok=True)
+          profile = {'id': model, 'baseUrl': 'https://openrouter.ai/api/v1/chat/completions', 'apiType': 'OpenAICompletion', 'apiKey': '${JUNIE_OPENROUTER_API_KEY}', 'providerName': 'OpenRouter', 'primaryModel': {'id': model}, 'fasterModel': {'id': model}}
+          (profile_dir / 'openrouter-free.json').write_text(json.dumps(profile))
+          with open(os.environ['GITHUB_ENV'], 'a') as environment:
+              environment.write('JUNIE_HOME=' + str(profile_home) + '\n')
+              environment.write('JUNIE_MODEL=custom:openrouter-free\n')
+              environment.write('PATH=' + str(binary.parent) + os.pathsep + os.environ['PATH'] + '\n')
+          print('PASS: pinned Junie CLI and Custom profile prepared with the guarded free model')
+          PY
+          python3 "$RUNNER_TEMP/prepare-junie.py"
           cat > tooling-e2e/console-feasibility.mjs <<'JS'
           import { _electron } from 'playwright'
           import { createRequire } from 'node:module'
-          import { mkdir, writeFile } from 'node:fs/promises'
+          import { mkdir, stat, writeFile } from 'node:fs/promises'
+          import { spawn } from 'node:child_process'
           import path from 'node:path'
           const root = process.cwd()
           const desktop = path.join(root, 'apps/switch-console-desktop')
@@ -90,7 +161,7 @@ jobs:
           const home = path.join(process.env.RUNNER_TEMP, 'console-demo-home')
           await mkdir(evidence, { recursive: true })
           await mkdir(home, { recursive: true })
-          const env = Object.fromEntries(['PATH', 'DISPLAY', 'XAUTHORITY', 'LANG', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'].filter(key => process.env[key]).map(key => [key, process.env[key]]))
+          const env = Object.fromEntries(['PATH', 'DISPLAY', 'XAUTHORITY', 'LANG', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'JUNIE_OPENROUTER_API_KEY', 'JUNIE_HOME', 'JUNIE_MODEL'].filter(key => process.env[key]).map(key => [key, process.env[key]]))
           Object.assign(env, { HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), CI: '1', SWITCH_CONSOLE_SERVER_VERSION: 'checkout' })
           let app
           let page
@@ -106,8 +177,12 @@ jobs:
             await writeFile(path.join(evidence, label + '.json'), redact(JSON.stringify(state, null, 2)))
             await page.screenshot({ path: path.join(evidence, label + '.png'), mask: [page.locator('input, textarea, pre, [role="log"]')] })
           }
+          let recording
+          let recordingClosed
           try {
-            app = await _electron.launch({ executablePath: require('electron'), args: ['--no-sandbox', desktop], cwd: desktop, env, timeout: 60000 })
+            recording = spawn('ffmpeg', ['-y', '-loglevel', 'error', '-f', 'x11grab', '-video_size', '1440x1000', '-framerate', '8', '-i', process.env.DISPLAY, '-t', '180', '-an', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '30', path.join(evidence, 'console-session.mp4')], { stdio: 'ignore' })
+            recordingClosed = new Promise(resolve => recording.once('close', resolve))
+            app = await _electron.launch({ executablePath: require('electron'), args: [desktop], cwd: desktop, env, timeout: 60000 })
             page = await app.firstWindow({ timeout: 45000 })
             await page.waitForLoadState('domcontentloaded')
             await page.locator('body').waitFor({ state: 'visible' })
@@ -125,6 +200,8 @@ jobs:
             await page.getByRole('button', { name: 'Continue', exact: true }).click()
             stage = 'local-setup'
             await page.getByRole('heading', { name: 'Set up a server on this computer', exact: true }).waitFor({ timeout: 30000 })
+            const analyticsSwitch = page.getByRole('switch', { name: 'Share anonymous usage data' })
+            if (await analyticsSwitch.isVisible() && await analyticsSwitch.getAttribute('aria-checked') === 'true') await analyticsSwitch.click()
             await capture('after-continue')
             const ready = page.getByText('Local server is running', { exact: true })
             // ConfirmButton adds a shortcut image's aria-label to its name.
@@ -152,15 +229,20 @@ jobs:
             throw error
           } finally {
             if (app) await app.close()
+            if (recording && recording.exitCode === null) recording.kill('SIGINT')
+            if (recordingClosed) await recordingClosed
+            const video = await stat(path.join(evidence, 'console-session.mp4')).catch(() => null)
+            if (!video || video.size < 1000) throw new Error('Bounded Console video was not recorded')
+            console.log('Console video recorded without audio')
           }
           JS
-          xvfb-run -a -s '-screen 0 1440x1000x24' node tooling-e2e/console-feasibility.mjs
+          node tooling-e2e/console-feasibility.mjs
           SESSION
       - name: Preserve launch evidence only
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: console-launch-evidence
+          name: console-video-evidence
           path: console-launch-evidence/
           if-no-files-found: ignore
           retention-days: 3
