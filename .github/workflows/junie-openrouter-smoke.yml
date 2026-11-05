@@ -13,7 +13,7 @@ jobs:
           JUNIE_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         shell: python
         run: |
-          import os, json, urllib.request, urllib.error, subprocess, tempfile, zipfile, pathlib, select, time
+          import os, json, urllib.request, urllib.error, subprocess, tempfile, zipfile, pathlib, queue, threading, time
           def stop(reason):
               print('STOP: ' + reason)
               with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
@@ -34,10 +34,20 @@ jobs:
           data = get('https://openrouter.ai/api/v1/key', True)['data']
           print('OpenRouter key authenticated, free tier:', data.get('is_free_tier'))
           print('Key spending limit:', data.get('limit'))
-          if data.get('limit') != 0:
-              stop('Key does not have a zero-dollar spending cap. Junie may use paid helper models. No inference attempted.')
-          models = get('https://openrouter.ai/api/v1/models')['data']
-          free = [m for m in models if m['id'].endswith(':free') and all(float(v) == 0 for v in m.get('pricing', {}).values()) and 'tools' in m.get('supported_parameters', [])]
+          models = get('https://openrouter.ai/api/v1/models/user', True)['data']
+          def explicitly_free(m):
+              prices = m.get('pricing', {})
+              return m['id'].endswith(':free') and 'prompt' in prices and 'completion' in prices and all(float(v) == 0 for v in prices.values() if v is not None)
+          if not models:
+              stop('Key-scoped model catalog is empty. No inference attempted.')
+          forbidden = [m['id'] for m in models if not explicitly_free(m)]
+          if forbidden:
+              print('Non-free or unverified models still allowed:', ', '.join(forbidden[:20]))
+              stop('Key-scoped catalog does not establish a free-only guardrail. No inference attempted.')
+          print('PASS: authenticated key-scoped catalog permits only explicitly free models:', ', '.join(m['id'] for m in models))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('Guardrail API evidence: /models/user contains only explicit :free models with zero listed prices. No paid-model probe was sent.\n')
+          free = [m for m in models if 'tools' in m.get('supported_parameters', [])]
           if not free:
               stop('No explicitly free tool-capable model in current catalog')
           free.sort(key=lambda m: ('qwen' not in m['id'].lower(), -m.get('context_length', 0)))
@@ -58,6 +68,12 @@ jobs:
               stop('Pinned Junie archive layout differs')
           env = dict(os.environ, JUNIE_HOME=str(root / 'state'), JUNIE_LLM_PROVIDER='openrouter', JUNIE_MODEL=model)
           proc = subprocess.Popen([str(binary), '--acp=true', '--provider', 'openrouter', '--model', model, '--max-steps', '2'], cwd=root, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+          inbox = queue.Queue()
+          def read_stdout():
+              for line in proc.stdout:
+                  inbox.put(line)
+              inbox.put(None)
+          threading.Thread(target=read_stdout, daemon=True).start()
           seq = 0
           chunks = []
           def rpc(method, params):
@@ -68,11 +84,12 @@ jobs:
               proc.stdin.flush()
               deadline = time.monotonic() + 120
               while time.monotonic() < deadline:
-                  if not select.select([proc.stdout], [], [], 1)[0]:
-                      if proc.poll() is not None:
-                          stop('Junie exited before ACP response')
+                  try:
+                      line = inbox.get(timeout=1)
+                  except queue.Empty:
                       continue
-                  line = proc.stdout.readline()
+                  if line is None:
+                      stop('Junie exited before ACP response')
                   try:
                       msg = json.loads(line)
                   except ValueError:
@@ -83,6 +100,7 @@ jobs:
                           chunks.append(update.get('content', {}).get('text', ''))
                   if msg.get('id') == request_id and ('result' in msg or 'error' in msg):
                       if 'error' in msg:
+                          print('ACP error:', str(msg['error'].get('message', '')).replace(key, '[REDACTED]')[:600])
                           stop('ACP rejected ' + method + ', code ' + str(msg['error'].get('code')) + '. Model/auth compatibility not established.')
                       return msg['result']
                   if 'id' in msg and 'method' in msg:
