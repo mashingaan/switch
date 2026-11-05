@@ -50,8 +50,9 @@ jobs:
           free = [m for m in models if 'tools' in m.get('supported_parameters', [])]
           if not free:
               stop('No explicitly free tool-capable model in current catalog')
-          free.sort(key=lambda m: ('qwen' not in m['id'].lower(), -m.get('context_length', 0)))
-          model = free[0]['id']
+          model = 'cohere/north-mini-code:free'
+          if model not in [m['id'] for m in free]:
+              stop('Requested alternate model is not allowed, free and tool-capable. No fallback.')
           print('Candidate free model:', model)
           root = pathlib.Path(tempfile.mkdtemp(prefix='junie-free-'))
           archive = root / 'junie.zip'
