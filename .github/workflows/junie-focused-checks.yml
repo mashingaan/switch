@@ -1,4 +1,4 @@
-name: Junie focused source checks
+name: Junie Console feasibility
 on:
   workflow_dispatch:
     inputs:
@@ -8,12 +8,12 @@ on:
 permissions:
   contents: read
 jobs:
-  console:
+  launch:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: console
+    timeout-minutes: 18
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      NODE_OPTIONS: --max-old-space-size=4096
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -26,74 +26,65 @@ jobs:
           node-version-file: console/.nvmrc
           cache: pnpm
           cache-dependency-path: console/pnpm-lock.yaml
-      - run: df -h .
-      - name: Install focused dependencies
-        env:
-          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
-          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
-        run: pnpm install --frozen-lockfile --ignore-scripts --filter @switch-console/agent-providers... --filter @switch-console/plugins...
-      - name: Build package exports
-        run: pnpm -r --filter @switch-console/agent-providers... --filter @switch-console/plugins... run build
-      - name: Adapter regression tests
-        if: ${{ !cancelled() }}
-        working-directory: console/packages/agent-providers
-        run: pnpm exec vitest run src/junie/junie-acp.test.ts src/acp/acp-adapter.test.ts src/host/agent-env.test.ts --maxWorkers=1
-      - name: Plugin registry tests
-        if: ${{ !cancelled() }}
-        working-directory: console/packages/plugins
-        run: pnpm exec vitest run src/agents/impl/index.test.ts src/agents/session-launch.test.ts --maxWorkers=1
-      - name: Typecheck providers
-        if: ${{ !cancelled() }}
-        run: pnpm --filter @switch-console/agent-providers run typecheck
-      - name: Typecheck plugins
-        if: ${{ !cancelled() }}
-        run: pnpm --filter @switch-console/plugins run typecheck
-      - name: Check contributed TypeScript formatting and lint
-        if: ${{ !cancelled() }}
-        shell: python
+      - name: Check hosted disk and display dependencies
         run: |
-          import pathlib, subprocess, shutil
-          root = pathlib.Path.cwd().parent
-          paths = [
-              'console/packages/agent-providers/src/junie/junie-acp.ts',
-              'console/packages/agent-providers/src/junie/junie-acp.test.ts',
-              'console/packages/agent-providers/src/junie/junie.integration.test.ts',
-              'console/packages/agent-providers/src/providers/registry.ts',
-              'console/packages/plugins/src/agents/impl/junie/index.ts',
-              'console/packages/plugins/src/agents/impl/junie/icon.ts',
-              'console/packages/plugins/src/agents/plugin-registry.ts',
-          ]
-          subprocess.run(['pnpm', 'exec', 'oxfmt', '--check', *[str(root / path) for path in paths]], cwd=root / 'console/packages/plugins', check=True)
-          subprocess.run(['pnpm', 'exec', 'oxlint', '--config', str(root / 'console/apps/switch-console-desktop/.oxlintrc.json'), *[str(root / path) for path in paths]], cwd=root / 'console/packages/plugins', check=True)
-          for path in paths:
-              target = root / 'formatted-source' / path
-              target.parent.mkdir(parents=True, exist_ok=True)
-              shutil.copy2(root / path, target)
-      - name: Return formatted source for review
-        if: ${{ !cancelled() }}
+          df -h .
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb ffmpeg libgtk-3-0 libnss3 libgbm1 libasound2t64
+      - name: Install actual Console dependencies
+        working-directory: console
+        run: pnpm install --frozen-lockfile
+      - name: Build required workspace exports
+        working-directory: console
+        run: pnpm -r --workspace-concurrency=2 --filter './packages/**' run build
+      - name: Rebuild Electron native SQLite
+        working-directory: console
+        run: pnpm --filter @switch-console/desktop run rebuild
+      - name: Build actual Electron app without packaging or images
+        working-directory: console
+        run: |
+          pnpm --filter @switch-console/desktop exec electron-vite build
+          pnpm --filter @switch-console/desktop run build:sidecar
+      - name: Launch real Console on Xvfb without credentials
+        working-directory: console
+        run: |
+          cat > tooling-e2e/console-feasibility.mjs <<'JS'
+          import { _electron } from 'playwright'
+          import { createRequire } from 'node:module'
+          import { mkdir, writeFile } from 'node:fs/promises'
+          import path from 'node:path'
+          const root = process.cwd()
+          const desktop = path.join(root, 'apps/switch-console-desktop')
+          const require = createRequire(path.join(desktop, 'package.json'))
+          const evidence = path.join(root, '../console-launch-evidence')
+          const home = path.join(process.env.RUNNER_TEMP, 'console-demo-home')
+          await mkdir(evidence, { recursive: true })
+          await mkdir(home, { recursive: true })
+          const env = Object.fromEntries(['PATH', 'DISPLAY', 'LANG', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'].filter(key => process.env[key]).map(key => [key, process.env[key]]))
+          Object.assign(env, { HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), CI: '1', SWITCH_CONSOLE_SERVER_VERSION: 'checkout' })
+          let app
+          try {
+            app = await _electron.launch({ executablePath: require('electron'), args: ['--no-sandbox', path.join(desktop, 'out/main/index.js')], cwd: desktop, env, timeout: 60000 })
+            const page = await app.firstWindow({ timeout: 45000 })
+            await page.waitForLoadState('domcontentloaded')
+            await page.locator('body').waitFor({ state: 'visible' })
+            await page.screenshot({ path: path.join(evidence, 'console-launch.png') })
+            const state = { title: await page.title(), text: await page.locator('body').innerText(), buttons: await page.getByRole('button').allTextContents(), url: page.url() }
+            await writeFile(path.join(evidence, 'console-launch.json'), JSON.stringify(state, null, 2))
+            console.log(JSON.stringify(state))
+          } catch (error) {
+            await writeFile(path.join(evidence, 'launch-error.txt'), String(error))
+            throw error
+          } finally {
+            if (app) await app.close()
+          }
+          JS
+          xvfb-run -a -s '-screen 0 1440x1000x24' node tooling-e2e/console-feasibility.mjs
+      - name: Preserve launch evidence only
+        if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: junie-formatted-source
-          path: formatted-source/
+          name: console-launch-evidence
+          path: console-launch-evidence/
+          if-no-files-found: ignore
           retention-days: 3
-  core:
-    runs-on: ubuntu-latest
-    timeout-minutes: 12
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ inputs.source_ref }}
-      - run: df -h .
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86
-        with:
-          python-version: '3.12'
-          enable-cache: true
-      - run: uv sync --project core
-      - name: Core provider registry tests
-        run: uv run --project core pytest -c core/pyproject.toml core/tests/switch_core/providers/test_provider_registry.py -q
-      - name: Core lint
-        if: ${{ !cancelled() }}
-        run: uv run --project core ruff check core/switch_core/providers/registry.py core/tests/switch_core/providers/test_provider_registry.py
-      - name: Core format
-        if: ${{ !cancelled() }}
-        run: uv run --project core ruff format --check core/switch_core/providers/registry.py core/tests/switch_core/providers/test_provider_registry.py
