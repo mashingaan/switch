@@ -22,23 +22,6 @@ const probe: AcpProviderHooks = {
       ? call.title.slice(0, separator)
       : undefined
   },
-  permission: (_context, request) => {
-    const call = request.toolCall
-    const input = call.rawInput ?? {}
-    const serverFields = Object.fromEntries(
-      ['server', 'serverName', 'mcpServer', 'mcpServerName', 'providerIdentifier', '_toolName']
-        .filter((name) => typeof input[name] === 'string')
-        .map((name) => [name, input[name]])
-    )
-    console.log('[DEBUG-junie-mcp] permission', JSON.stringify({
-      kind: call.kind,
-      title: call.title,
-      meta: call._meta,
-      rawInputKeys: Object.keys(input),
-      serverFields,
-    }).replace(key ?? '', '[REDACTED]').slice(0, 1800))
-    return undefined
-  },
   launch: ({ binaryPath, env }) => ({
     command: binaryPath,
     args: ['--acp=true', '--model', 'custom:openrouter-free', '--max-steps', '8'],
@@ -57,19 +40,7 @@ if (!key || !home || !process.env.JUNIE_BINARY) {
 }
 
 describeConformance('junie-free-probe', {
-  createAdapter: async () => {
-    const adapter = createAcpAdapter(probe, {})
-    adapter.subscribe((event) => {
-      if (event.type === 'session.started' || event.type === 'request.opened') {
-        console.log('[DEBUG-junie-mcp]', event.type)
-      }
-      if (event.type === 'turn.completed') {
-        console.log('[DEBUG-junie-mcp] turn.completed', event.outcome,
-          event.message?.replace(key, '[REDACTED]'))
-      }
-    })
-    return adapter
-  },
+  createAdapter: async () => createAcpAdapter(probe, {}),
   unavailableReason: async () => null,
   timeoutMs: 90_000,
   env: { JUNIE_OPENROUTER_API_KEY: key, JUNIE_HOME: home },
