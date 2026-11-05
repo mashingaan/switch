@@ -1,0 +1,104 @@
+name: Junie OpenRouter free smoke
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Free-only preflight and real ACP smoke
+        env:
+          JUNIE_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        shell: python
+        run: |
+          import os, json, urllib.request, urllib.error, subprocess, tempfile, zipfile, pathlib, select, time
+          def stop(reason):
+              print('STOP: ' + reason)
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+                  f.write('STOP: ' + reason + '\n')
+              raise SystemExit(1)
+          key = os.environ.get('JUNIE_OPENROUTER_API_KEY', '')
+          if not key:
+              stop('OPENROUTER_API_KEY secret is missing')
+          def get(url, auth=False):
+              headers = {'User-Agent': 'switch-junie-free-smoke'}
+              if auth:
+                  headers['Authorization'] = 'Bearer ' + key
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as r:
+                      return json.load(r)
+              except urllib.error.HTTPError as e:
+                  stop('API HTTP ' + str(e.code) + ', no retries or paid fallback')
+          data = get('https://openrouter.ai/api/v1/key', True)['data']
+          print('OpenRouter key authenticated, free tier:', data.get('is_free_tier'))
+          print('Key spending limit:', data.get('limit'))
+          if data.get('limit') != 0:
+              stop('Key does not have a zero-dollar spending cap. Junie may use paid helper models. No inference attempted.')
+          models = get('https://openrouter.ai/api/v1/models')['data']
+          free = [m for m in models if m['id'].endswith(':free') and all(float(v) == 0 for v in m.get('pricing', {}).values()) and 'tools' in m.get('supported_parameters', [])]
+          if not free:
+              stop('No explicitly free tool-capable model in current catalog')
+          free.sort(key=lambda m: ('qwen' not in m['id'].lower(), -m.get('context_length', 0)))
+          model = free[0]['id']
+          print('Candidate free model:', model)
+          root = pathlib.Path(tempfile.mkdtemp(prefix='junie-free-'))
+          archive = root / 'junie.zip'
+          url = 'https://github.com/JetBrains/junie-acp-release/releases/download/3959.5/junie-release-3959.5-linux-amd64.zip'
+          urllib.request.urlretrieve(url, archive)
+          with zipfile.ZipFile(archive) as z:
+              z.extractall(root)
+              for item in z.infolist():
+                  mode = item.external_attr >> 16
+                  if mode:
+                      (root / item.filename).chmod(mode)
+          binary = root / 'junie-app/bin/junie'
+          if not binary.exists():
+              stop('Pinned Junie archive layout differs')
+          env = dict(os.environ, JUNIE_HOME=str(root / 'state'), JUNIE_LLM_PROVIDER='openrouter', JUNIE_MODEL=model)
+          proc = subprocess.Popen([str(binary), '--acp=true', '--provider', 'openrouter', '--model', model, '--max-steps', '2'], cwd=root, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+          seq = 0
+          chunks = []
+          def rpc(method, params):
+              global seq
+              seq += 1
+              request_id = seq
+              proc.stdin.write(json.dumps({'jsonrpc':'2.0','id':request_id,'method':method,'params':params}) + '\n')
+              proc.stdin.flush()
+              deadline = time.monotonic() + 120
+              while time.monotonic() < deadline:
+                  if not select.select([proc.stdout], [], [], 1)[0]:
+                      if proc.poll() is not None:
+                          stop('Junie exited before ACP response')
+                      continue
+                  line = proc.stdout.readline()
+                  try:
+                      msg = json.loads(line)
+                  except ValueError:
+                      continue
+                  if msg.get('method') == 'session/update':
+                      update = msg.get('params', {}).get('update', {})
+                      if update.get('sessionUpdate') == 'agent_message_chunk':
+                          chunks.append(update.get('content', {}).get('text', ''))
+                  if msg.get('id') == request_id and ('result' in msg or 'error' in msg):
+                      if 'error' in msg:
+                          stop('ACP rejected ' + method + ', code ' + str(msg['error'].get('code')) + '. Model/auth compatibility not established.')
+                      return msg['result']
+                  if 'id' in msg and 'method' in msg:
+                      proc.stdin.write(json.dumps({'jsonrpc':'2.0','id':msg['id'],'error':{'code':-32601,'message':'Unsupported by minimal smoke'}}) + '\n')
+                      proc.stdin.flush()
+              stop('ACP timeout, no retry or fallback')
+          try:
+              init = rpc('initialize', {'protocolVersion':1,'clientCapabilities':{},'clientInfo':{'name':'free-smoke','version':'1'}})
+              print('ACP initialized, pinned build 3959.5')
+              session = rpc('session/new', {'cwd':str(root),'mcpServers':[]})
+              rpc('session/prompt', {'sessionId':session['sessionId'],'prompt':[{'type':'text','text':'Reply exactly SWITCH_FREE_SMOKE_OK. Do not use tools.'}]})
+              if 'SWITCH_FREE_SMOKE_OK' not in ''.join(chunks):
+                  stop('No expected real model response, no conformance run')
+              print('PASS: real Junie ACP model response')
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+                  f.write('PASS: real Junie 3959.5 ACP response using ' + model + '\n')
+          finally:
+              proc.kill()
+              proc.wait()
