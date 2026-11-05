@@ -58,6 +58,7 @@ jobs:
           eval "$(gnome-keyring-daemon --start --components=secrets)"
           printf '%s' 'temporary-keyring-preflight' | secret-tool store --label='Switch safe storage preflight' service switch-console account runner
           test "$(secret-tool lookup service switch-console account runner)" = 'temporary-keyring-preflight'
+          printf '%s\n' 'PASS: libsecret stored and retrieved a temporary value'
           mkdir -p "$RUNNER_TEMP/safe-storage-preflight"
           printf '%s\n' '{"main":"main.cjs"}' > "$RUNNER_TEMP/safe-storage-preflight/package.json"
           cat > "$RUNNER_TEMP/safe-storage-preflight/main.cjs" <<'PREFLIGHT'
@@ -80,6 +81,11 @@ jobs:
           })
           PREFLIGHT
           ELECTRON_BIN="$(node -e "const { createRequire } = require('node:module'); const path = require('node:path'); console.log(createRequire(path.join(process.cwd(), 'apps/switch-console-desktop/package.json'))('electron'))")"
+          SANDBOX_HELPER="$(dirname "$ELECTRON_BIN")/chrome-sandbox"
+          test -f "$SANDBOX_HELPER"
+          sudo chown root:root "$SANDBOX_HELPER"
+          sudo chmod 4755 "$SANDBOX_HELPER"
+          test "$(stat -c '%U:%a' "$SANDBOX_HELPER")" = 'root:4755'
           "$ELECTRON_BIN" "$RUNNER_TEMP/safe-storage-preflight"
           cat > "$RUNNER_TEMP/prepare-junie.py" <<'PY'
           import json
@@ -148,6 +154,9 @@ jobs:
           print('PASS: pinned Junie CLI and Custom profile prepared with the guarded free model')
           PY
           python3 "$RUNNER_TEMP/prepare-junie.py"
+          export JUNIE_HOME="$RUNNER_TEMP/junie-home"
+          export JUNIE_MODEL=custom:openrouter-free
+          export PATH="$RUNNER_TEMP/junie-app/bin:$PATH"
           cat > tooling-e2e/console-feasibility.mjs <<'JS'
           import { _electron } from 'playwright'
           import { createRequire } from 'node:module'
