@@ -72,6 +72,26 @@ jobs:
             const state = { title: await page.title(), text: await page.locator('body').innerText(), buttons: await page.getByRole('button').allTextContents(), url: page.url() }
             await writeFile(path.join(evidence, 'console-launch.json'), JSON.stringify(state, null, 2))
             console.log(JSON.stringify(state))
+            const skip = page.getByRole('button', { name: 'Skip', exact: true })
+            if (await skip.isVisible()) await skip.click()
+            await page.getByRole('button', { name: 'Get started', exact: true }).click({ timeout: 30000 })
+            await page.getByRole('radio', { name: /On this computer/ }).click()
+            await page.getByRole('button', { name: 'Continue', exact: true }).click()
+            await page.getByRole('button', { name: 'Start', exact: true }).click({ timeout: 30000 })
+            const ready = page.getByText('Local server is running', { exact: true })
+            const deadline = Date.now() + 240000
+            let started = false
+            while (Date.now() < deadline) {
+              if (await ready.isVisible()) { started = true
+                break }
+              if (await page.getByRole('button', { name: 'Retry', exact: true }).isVisible()) break
+              await new Promise(resolve => setTimeout(resolve, 2000))
+            }
+            const redact = text => text.replace(/(postgres(?:ql)?:\/\/)[^@\s]+@/g, '$1[REDACTED]@').replace(/((?:password|token|secret|api.key)\s*[:=]\s*)\S+/gi, '$1[REDACTED]')
+            const result = { nativeServerReady: started, alerts: (await page.getByRole('alert').allTextContents()).map(redact), buttons: await page.getByRole('button').allTextContents() }
+            await writeFile(path.join(evidence, 'native-server-result.json'), JSON.stringify(result, null, 2))
+            console.log(JSON.stringify(result))
+            if (!started) throw new Error('Real native-server setup did not complete within the bounded feasibility attempt. See sanitized native-server-result.json.')
           } catch (error) {
             await writeFile(path.join(evidence, 'launch-error.txt'), String(error))
             throw error
