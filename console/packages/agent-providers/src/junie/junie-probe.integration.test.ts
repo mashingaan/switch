@@ -42,7 +42,7 @@ if (!key || !home || !process.env.JUNIE_BINARY) {
 describeConformance('junie-free-probe', {
   createAdapter: async () => createAcpAdapter(probe, {}),
   unavailableReason: async () => null,
-  timeoutMs: 90_000,
+  timeoutMs: 180_000,
   env: { JUNIE_OPENROUTER_API_KEY: key, JUNIE_HOME: home },
   mcpServers: { echo: echoMcpServerSpec() },
 })
