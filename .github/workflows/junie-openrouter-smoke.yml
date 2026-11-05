@@ -34,6 +34,8 @@ jobs:
           data = get('https://openrouter.ai/api/v1/key', True)['data']
           print('OpenRouter key authenticated, free tier:', data.get('is_free_tier'))
           print('Key spending limit:', data.get('limit'))
+          if data.get('limit') != 0:
+              stop('Zero-dollar key cap is no longer set. No inference attempted.')
           models = get('https://openrouter.ai/api/v1/models/user', True)['data']
           def explicitly_free(m):
               prices = m.get('pricing', {})
@@ -67,8 +69,23 @@ jobs:
           binary = root / 'junie-app/bin/junie'
           if not binary.exists():
               stop('Pinned Junie archive layout differs')
-          env = dict(os.environ, JUNIE_HOME=str(root / 'state'), JUNIE_LLM_PROVIDER='openrouter', JUNIE_MODEL=model)
-          proc = subprocess.Popen([str(binary), '--acp=true', '--provider', 'openrouter', '--model', model, '--max-steps', '2'], cwd=root, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+          profile_dir = root / 'state' / 'models'
+          profile_dir.mkdir(parents=True)
+          profile = {
+              'id': model,
+              'baseUrl': 'https://openrouter.ai/api/v1/chat/completions',
+              'apiType': 'OpenAICompletion',
+              'apiKey': '${JUNIE_OPENROUTER_API_KEY}',
+              'providerName': 'OpenRouter',
+              'primaryModel': {'id': model},
+              'fasterModel': {'id': model}
+          }
+          (profile_dir / 'openrouter-free.json').write_text(json.dumps(profile))
+          env = dict(os.environ, JUNIE_HOME=str(root / 'state'), JUNIE_MODEL='custom:openrouter-free')
+          env.pop('JUNIE_LLM_PROVIDER', None)
+          stderr_path = root / 'junie-stderr.log'
+          stderr_file = stderr_path.open('w')
+          proc = subprocess.Popen([str(binary), '--acp=true', '--model', 'custom:openrouter-free', '--max-steps', '2'], cwd=root, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_file, text=True)
           inbox = queue.Queue()
           def read_stdout():
               for line in proc.stdout:
@@ -121,3 +138,9 @@ jobs:
           finally:
               proc.kill()
               proc.wait()
+              stderr_file.close()
+              diagnostic = stderr_path.read_text(errors='replace').replace(key, '[REDACTED]')
+              if diagnostic:
+                  print('Junie stderr tail:', diagnostic[-1800:])
+              after = get('https://openrouter.ai/api/v1/key', True)['data']
+              print('Key usage before:', data.get('usage'), 'after:', after.get('usage'))
