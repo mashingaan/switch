@@ -54,7 +54,15 @@ jobs:
         run: |
           import pathlib, subprocess, shutil
           root = pathlib.Path.cwd().parent
-          paths = subprocess.check_output(['git', 'diff', '--name-only', 'e929824c74f6b57912fef7e0fd2e5968752747a0', 'HEAD', '--', '*.ts'], cwd=root, text=True).splitlines()
+          paths = [
+              'console/packages/agent-providers/src/junie/junie-acp.ts',
+              'console/packages/agent-providers/src/junie/junie-acp.test.ts',
+              'console/packages/agent-providers/src/junie/junie.integration.test.ts',
+              'console/packages/agent-providers/src/providers/registry.ts',
+              'console/packages/plugins/src/agents/impl/junie/index.ts',
+              'console/packages/plugins/src/agents/impl/junie/icon.ts',
+              'console/packages/plugins/src/agents/plugin-registry.ts',
+          ]
           subprocess.run(['pnpm', 'exec', 'oxfmt', '--write', *[str(root / path) for path in paths]], cwd=root / 'console/packages/plugins', check=True)
           for path in paths:
               target = root / 'formatted-source' / path
