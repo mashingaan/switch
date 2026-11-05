@@ -60,11 +60,11 @@ jobs:
           const home = path.join(process.env.RUNNER_TEMP, 'console-demo-home')
           await mkdir(evidence, { recursive: true })
           await mkdir(home, { recursive: true })
-          const env = Object.fromEntries(['PATH', 'DISPLAY', 'LANG', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'].filter(key => process.env[key]).map(key => [key, process.env[key]]))
+          const env = Object.fromEntries(['PATH', 'DISPLAY', 'XAUTHORITY', 'LANG', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'].filter(key => process.env[key]).map(key => [key, process.env[key]]))
           Object.assign(env, { HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), CI: '1', SWITCH_CONSOLE_SERVER_VERSION: 'checkout' })
           let app
           try {
-            app = await _electron.launch({ executablePath: require('electron'), args: ['--no-sandbox', path.join(desktop, 'out/main/index.js')], cwd: desktop, env, timeout: 60000 })
+            app = await _electron.launch({ executablePath: require('electron'), args: ['--no-sandbox', desktop], cwd: desktop, env, timeout: 60000 })
             const page = await app.firstWindow({ timeout: 45000 })
             await page.waitForLoadState('domcontentloaded')
             await page.locator('body').waitFor({ state: 'visible' })
