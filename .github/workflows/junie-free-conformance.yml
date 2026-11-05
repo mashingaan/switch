@@ -1,6 +1,12 @@
 name: Junie free conformance diagnostic
 on:
   workflow_dispatch:
+    inputs:
+      scenarios:
+        description: 'Vitest scenario name pattern, no model fallback'
+        required: true
+        default: '.'
+        type: string
 permissions:
   contents: read
 jobs:
@@ -110,8 +116,9 @@ jobs:
       - name: Real Junie conformance, stop on first failure
         working-directory: console/packages/agent-providers
         env:
+          TEST_PATTERN: ${{ inputs.scenarios }}
           JUNIE_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: pnpm exec vitest run src/junie/junie-probe.integration.test.ts --maxWorkers=1 --bail=1 --reporter=default --reporter=json --outputFile=junie-conformance.json
+        run: pnpm exec vitest run src/junie/junie-probe.integration.test.ts --maxWorkers=1 --bail=1 --testNamePattern "$TEST_PATTERN" --reporter=default --reporter=json --outputFile=junie-conformance.json
       - name: Record outcome and key usage
         if: ${{ always() }}
         env:
