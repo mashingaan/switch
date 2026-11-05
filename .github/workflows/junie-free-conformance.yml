@@ -1,0 +1,136 @@
+name: Junie free conformance diagnostic
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Guarded free-only Junie setup
+        env:
+          JUNIE_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        shell: python
+        run: |
+          import os, json, urllib.request, urllib.error, subprocess, tempfile, zipfile, pathlib, queue, threading, time
+          def stop(reason):
+              print('STOP: ' + reason)
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+                  f.write('STOP: ' + reason + '\n')
+              raise SystemExit(1)
+          key = os.environ.get('JUNIE_OPENROUTER_API_KEY', '')
+          if not key:
+              stop('OPENROUTER_API_KEY secret is missing')
+          def get(url, auth=False):
+              headers = {'User-Agent': 'switch-junie-free-smoke'}
+              if auth:
+                  headers['Authorization'] = 'Bearer ' + key
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as r:
+                      return json.load(r)
+              except urllib.error.HTTPError as e:
+                  stop('API HTTP ' + str(e.code) + ', no retries or paid fallback')
+          data = get('https://openrouter.ai/api/v1/key', True)['data']
+          print('OpenRouter key authenticated, free tier:', data.get('is_free_tier'))
+          print('Key spending limit:', data.get('limit'))
+          if data.get('limit') != 0:
+              stop('Zero-dollar key cap is no longer set. No inference attempted.')
+          models = get('https://openrouter.ai/api/v1/models/user', True)['data']
+          def explicitly_free(m):
+              prices = m.get('pricing', {})
+              return m['id'].endswith(':free') and 'prompt' in prices and 'completion' in prices and all(float(v) == 0 for v in prices.values() if v is not None)
+          if not models:
+              stop('Key-scoped model catalog is empty. No inference attempted.')
+          forbidden = [m['id'] for m in models if not explicitly_free(m)]
+          if forbidden:
+              print('Non-free or unverified models still allowed:', ', '.join(forbidden[:20]))
+              stop('Key-scoped catalog does not establish a free-only guardrail. No inference attempted.')
+          print('PASS: authenticated key-scoped catalog permits only explicitly free models:', ', '.join(m['id'] for m in models))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('Guardrail API evidence: /models/user contains only explicit :free models with zero listed prices. No paid-model probe was sent.\n')
+          free = [m for m in models if 'tools' in m.get('supported_parameters', [])]
+          if not free:
+              stop('No explicitly free tool-capable model in current catalog')
+          model = 'cohere/north-mini-code:free'
+          if model not in [m['id'] for m in free]:
+              stop('Requested alternate model is not allowed, free and tool-capable. No fallback.')
+          print('Candidate free model:', model)
+          root = pathlib.Path(tempfile.mkdtemp(prefix='junie-free-'))
+          archive = root / 'junie.zip'
+          url = 'https://github.com/JetBrains/junie-acp-release/releases/download/3959.5/junie-release-3959.5-linux-amd64.zip'
+          urllib.request.urlretrieve(url, archive)
+          with zipfile.ZipFile(archive) as z:
+              z.extractall(root)
+              for item in z.infolist():
+                  mode = item.external_attr >> 16
+                  if mode:
+                      (root / item.filename).chmod(mode)
+          binary = root / 'junie-app/bin/junie'
+          if not binary.exists():
+              stop('Pinned Junie archive layout differs')
+          profile_dir = root / 'state' / 'models'
+          profile_dir.mkdir(parents=True)
+          profile = {
+              'id': model,
+              'baseUrl': 'https://openrouter.ai/api/v1/chat/completions',
+              'apiType': 'OpenAICompletion',
+              'apiKey': '${JUNIE_OPENROUTER_API_KEY}',
+              'providerName': 'OpenRouter',
+              'primaryModel': {'id': model},
+              'fasterModel': {'id': model}
+          }
+          (profile_dir / 'openrouter-free.json').write_text(json.dumps(profile))
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write('JUNIE_BINARY=' + str(binary) + '\n')
+              f.write('JUNIE_HOME=' + str(root / 'state') + '\n')
+              f.write('OPENROUTER_USAGE_BEFORE=' + str(data.get('usage')) + '\n')
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 10.28.2
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: console/.nvmrc
+          cache: pnpm
+          cache-dependency-path: console/pnpm-lock.yaml
+      - name: Check hosted disk space
+        run: df -h .
+      - name: Install focused workspace dependencies
+        working-directory: console
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+        run: pnpm install --frozen-lockfile --ignore-scripts --filter @switch-console/agent-providers...
+      - name: Build required shared exports
+        working-directory: console
+        run: pnpm --filter @switch-console/shared run build
+      - name: Real Junie conformance, stop on first failure
+        working-directory: console/packages/agent-providers
+        env:
+          JUNIE_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: pnpm exec vitest run src/junie/junie-probe.integration.test.ts --maxWorkers=1 --bail=1 --reporter=default --reporter=json --outputFile=junie-conformance.json
+      - name: Record outcome and key usage
+        if: ${{ always() }}
+        env:
+          JUNIE_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        shell: python
+        run: |
+          import os, json, pathlib, urllib.request
+          report = pathlib.Path('console/packages/agent-providers/junie-conformance.json')
+          if report.exists():
+              results = json.loads(report.read_text())
+              for suite in results.get('testResults', []):
+                  for test in suite.get('assertionResults', []):
+                      print(test.get('title'), test.get('status'), test.get('duration'))
+          key = os.environ['JUNIE_OPENROUTER_API_KEY']
+          request = urllib.request.Request('https://openrouter.ai/api/v1/key', headers={'Authorization': 'Bearer ' + key})
+          with urllib.request.urlopen(request, timeout=30) as r:
+              usage = json.load(r)['data'].get('usage')
+          print('Key usage before:', os.environ.get('OPENROUTER_USAGE_BEFORE'), 'after:', usage)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('Exact head: ' + os.environ['GITHUB_SHA'] + '\n')
+              f.write('Custom OpenRouter model for both roles: cohere/north-mini-code:free\n')
+              f.write('Key usage before: ' + os.environ.get('OPENROUTER_USAGE_BEFORE', 'unknown') + ', after: ' + str(usage) + '\n')
